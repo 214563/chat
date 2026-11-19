@@ -230,6 +230,23 @@
                 try {
                     var v = await localforage.getItem(k);
                     if (v === undefined) continue;
+                    // ← PATCH1
+                    if (k.indexOf('chatMessages') !== -1 && Array.isArray(v)) {
+                        payload.indexedDB[k] = v.map(function (msg) {
+                            if (!msg || typeof msg !== 'object') return msg;
+                            var copy = null;
+                            if (typeof msg.image === 'string' && msg.image.indexOf('data:') === 0) {
+                                copy = Object.assign({}, msg, { image: null });
+                            }
+                            if (msg.voice && typeof msg.voice === 'object' &&
+                                typeof msg.voice.url === 'string' && msg.voice.url.indexOf('data:') === 0) {
+                                copy = copy || Object.assign({}, msg);
+                                copy.voice = Object.assign({}, msg.voice, { url: '' });
+                            }
+                            return copy || msg;
+                        });
+                        continue;
+                    }
                     // 阶段三B 修：backgroundGallery 本地 value 现在是全尺寸 base64
                     // 同步时把 value 换成 cloudUrl（oss:// 引用），让换设备恢复时能从云端下载
                     // 没有 cloudUrl 的（未上云）：如果有 thumbnail 用 thumbnail 兜底，否则跳过
@@ -530,7 +547,19 @@
         if (!res.ok) {
             throw new Error('下载失败：HTTP ' + res.status);
         }
-        var text = await res.text();
+        var MAX_BYTES = 60 * 1024 * 1024;
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var parts = [], total = 0;
+        while (true) {
+            var step = await reader.read();
+            if (step.done) break;
+            total += step.value.byteLength;
+            if (total > MAX_BYTES) { try { await reader.cancel(); } catch (e) {} throw new Error('云端备份过大，已中止下载'); }
+            parts.push(decoder.decode(step.value, { stream: true }));
+        }
+        parts.push(decoder.decode());
+        var text = parts.join('');
         try {
             return JSON.parse(text);
         } catch (e) {
@@ -740,6 +769,11 @@
         try {
             var payload = await _collectTextData();
             var jsonString = JSON.stringify(payload);
+            // ← PATCH3
+            if (jsonString.length > 30 * 1024 * 1024) {
+                console.warn('[CloudSync] 同步包过大已放弃，建议迁移图片');
+                throw new Error('同步包过大，建议先迁移本地图片到云端');
+            }
             await _uploadToOSS(jsonString);
             // 顺便更新云端 index（登记当前梦角）— 失败不影响主同步
             _updateIndex(payload);
